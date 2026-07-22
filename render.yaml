@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: fluxvpn-miniapp
+    runtime: python
+    plan: free
+    region: frankfurt
+    autoDeploy: true
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.11"
+      - key: BOT_TOKEN
+        value: "8928692194:AAGVa9GhAQUg4Z4LilcoYzoCnYcJF6gMMZU"
+      - key: DATABASE_URL
+        value: "postgresql://neondb_owner:npg_KjqZrHsJn6E1@ep-noisy-butterfly-avbk5yxh.c-11.us-east-1.aws.neon.tech/neondb?sslmode=require"
+      - key: CRYPTO_BOT_TOKEN
+        value: "599850:AA21TXJWkZO0aZT8DZFbB6NIwdj6jtKZ3YB"
+      - key: ADMIN_ID
+        value: "6049379160"
+      - key: ADMIN_USERNAME
+        value: "zrdws"
