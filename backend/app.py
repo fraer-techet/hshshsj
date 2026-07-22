@@ -240,4 +240,3 @@ def bot_loop():
         except Exception:print("BOT",traceback.format_exc(),flush=True);time.sleep(3)
 def start():
     server=ThreadingHTTPServer(("0.0.0.0",PORT),Handler);threading.Thread(target=server.serve_forever,daemon=True).start();threading.Thread(target=bot_loop,daemon=True).start();return server
-
