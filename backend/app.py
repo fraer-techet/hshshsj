@@ -80,7 +80,12 @@ class Handler(BaseHTTPRequestHandler):
     def file(self,path):
         target=os.path.join(STATIC,path)
         if not os.path.isfile(target):self.send_error(404);return
-        data=open(target,"rb").read();self.send_response(200);self.send_header("Content-Type",mimetypes.guess_type(target)[0] or "application/octet-stream");self.send_header("Content-Length",str(len(data)));self.end_headers();self.wfile.write(data)
+        data=open(target,"rb").read();self.send_response(200);self.send_header("Content-Type",mimetypes.guess_type(target)[0] or "application/octet-stream");self.send_header("Cache-Control","no-store, max-age=0");self.send_header("Content-Length",str(len(data)));self.end_headers();self.wfile.write(data)
+    def do_HEAD(self):
+        path=urllib.parse.urlparse(self.path).path
+        if path in ("/","/app","/app/","/health"):
+            self.send_response(200);self.send_header("Content-Length","0");self.send_header("Cache-Control","no-store");self.end_headers();return
+        self.send_response(404);self.send_header("Content-Length","0");self.end_headers()
     def do_GET(self):self.route("GET")
     def do_POST(self):self.route("POST")
     def do_DELETE(self):self.route("DELETE")
