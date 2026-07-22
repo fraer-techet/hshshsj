@@ -70,6 +70,7 @@ def migrate(db):
             raise
     import_legacy(db)
     seed_server_catalog(db)
+    seed_server_catalog_2(db)
 
 def seed_server_catalog(db):
     marker = 6
@@ -86,6 +87,29 @@ def seed_server_catalog(db):
                 name=name, config=config, sort=sort_order, key=seed_key,
             )
         db.run("insert into app_schema_migrations(version,name) values(:version,'server_catalog_data')", version=marker)
+        db.run("commit")
+    except Exception:
+        try:
+            db.run("rollback")
+        except Exception:
+            pass
+        raise
+
+def seed_server_catalog_2(db):
+    marker = 7
+    if db.run("select 1 from app_schema_migrations where version=:version", version=marker):
+        return
+    from .server_catalog_2 import SERVER_CATALOG_2
+    try:
+        db.run("begin")
+        for sort_order, (seed_key, name, config) in enumerate(SERVER_CATALOG_2, start=1000):
+            db.run(
+                "insert into app_servers(name,config,enabled,sort_order,seed_key) "
+                "select :name,:config,true,:sort,:key "
+                "where not exists (select 1 from app_servers where seed_key=:key or config=:config)",
+                name=name, config=config, sort=sort_order, key=seed_key,
+            )
+        db.run("insert into app_schema_migrations(version,name) values(:version,'server_catalog_data_2')", version=marker)
         db.run("commit")
     except Exception:
         try:
