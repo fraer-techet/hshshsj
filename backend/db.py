@@ -35,6 +35,10 @@ MIGRATIONS = [
 "create index if not exists app_tickets_status_idx on app_tickets(status,updated_at desc)",
 "create index if not exists app_devices_user_idx on app_devices(telegram_id,blocked,last_seen desc)",
 ]),
+(5, "server_catalog", [
+"alter table app_servers add column if not exists seed_key text",
+"create unique index if not exists app_servers_seed_key_uq on app_servers(seed_key)",
+]),
 ]
 
 def connection():
@@ -65,6 +69,30 @@ def migrate(db):
             except Exception:pass
             raise
     import_legacy(db)
+    seed_server_catalog(db)
+
+def seed_server_catalog(db):
+    marker = 6
+    if db.run("select 1 from app_schema_migrations where version=:version", version=marker):
+        return
+    from .server_catalog import SERVER_CATALOG
+    try:
+        db.run("begin")
+        for sort_order, (seed_key, name, config) in enumerate(SERVER_CATALOG, start=100):
+            db.run(
+                "insert into app_servers(name,config,enabled,sort_order,seed_key) "
+                "select :name,:config,true,:sort,:key "
+                "where not exists (select 1 from app_servers where seed_key=:key or config=:config)",
+                name=name, config=config, sort=sort_order, key=seed_key,
+            )
+        db.run("insert into app_schema_migrations(version,name) values(:version,'server_catalog_data')", version=marker)
+        db.run("commit")
+    except Exception:
+        try:
+            db.run("rollback")
+        except Exception:
+            pass
+        raise
 
 def table_exists(db,name):
     rows=db.run("select to_regclass(:name)",name="public."+name)
