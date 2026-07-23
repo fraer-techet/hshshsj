@@ -21,3 +21,5 @@ services:
         value: "6049379160"
       - key: ADMIN_USERNAME
         value: "zrdws"
+      - key: REQUIRED_CHANNEL
+        value: "@fluxvvpn"
