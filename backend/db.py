@@ -39,6 +39,12 @@ MIGRATIONS = [
 "alter table app_servers add column if not exists seed_key text",
 "create unique index if not exists app_servers_seed_key_uq on app_servers(seed_key)",
 ]),
+(8, "json_profiles", [
+"create table if not exists app_json_configs(id bigserial primary key,name text not null,config text not null,enabled boolean not null default true,sort_order integer not null default 0,seed_key text unique,created_at timestamptz not null default now(),updated_at timestamptz not null default now())",
+]),
+(10, "remove_json_profiles", [
+"drop table if exists app_json_configs",
+]),
 ]
 
 def connection():
@@ -71,6 +77,7 @@ def migrate(db):
     import_legacy(db)
     seed_server_catalog(db)
     seed_server_catalog_2(db)
+    seed_server_catalog_3(db)
 
 def seed_server_catalog(db):
     marker = 6
@@ -110,6 +117,30 @@ def seed_server_catalog_2(db):
                 name=name, config=config, sort=sort_order, key=seed_key,
             )
         db.run("insert into app_schema_migrations(version,name) values(:version,'server_catalog_data_2')", version=marker)
+        db.run("commit")
+    except Exception:
+        try:
+            db.run("rollback")
+        except Exception:
+            pass
+        raise
+
+def seed_server_catalog_3(db):
+    marker = 12
+    if db.run("select 1 from app_schema_migrations where version=:version", version=marker):
+        return
+    from .server_catalog_3 import SERVER_CATALOG_3
+    try:
+        db.run("begin")
+        db.run("delete from app_servers where seed_key like 'batch3-%'")
+        for sort_order, (seed_key, name, config) in enumerate(SERVER_CATALOG_3, start=2000):
+            db.run(
+                "insert into app_servers(name,config,enabled,sort_order,seed_key) "
+                "select :name,:config,true,:sort,:key "
+                "where not exists (select 1 from app_servers where seed_key=:key or config=:config)",
+                name=name, config=config, sort=sort_order, key=seed_key,
+            )
+        db.run("insert into app_schema_migrations(version,name) values(:version,'server_catalog_curated_replacement')", version=marker)
         db.run("commit")
     except Exception:
         try:

@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import html
 import json
@@ -71,6 +72,32 @@ def sub_response(handler,text,user):
     for k,v in {"Content-Type":"text/plain; charset=utf-8","Cache-Control":"no-store","Profile-Title":"base64:Rmx1eFZQTg","Profile-Update-Interval":"1","Subscription-Userinfo":f"upload=0; download=0; total=0; expire={timestamp}","Content-Length":str(len(data))}.items():handler.send_header(k,v)
     handler.end_headers();handler.wfile.write(data)
 def dummy(title):return "vless://00000000-0000-0000-0000-000000000000@127.0.0.1:1?encryption=none&security=none&type=tcp#"+urllib.parse.quote(title,safe="")+"\n"
+
+SUPPORTED_URI_SCHEMES={"vless","trojan","ss","vmess","socks","hysteria2","hy2","tuic","ssr"}
+def b64decode_loose(value):
+    raw=value.encode();raw+=b"="*((4-len(raw)%4)%4)
+    return base64.urlsafe_b64decode(raw)
+def validate_share_uri(value):
+    config=str(value or "").strip()
+    if not config or "\n" in config or "\r" in config:raise ValueError("one URI per server")
+    scheme=config.split(":",1)[0].lower() if ":" in config else ""
+    if scheme not in SUPPORTED_URI_SCHEMES:raise ValueError("supported: vless, trojan, ss, vmess, socks, hysteria2, hy2, tuic, ssr")
+    if scheme=="vmess":
+        try:
+            payload=config.split("#",1)[0][8:];parsed=json.loads(b64decode_loose(payload).decode())
+            if not isinstance(parsed,dict) or not parsed.get("add") or not parsed.get("port"):raise ValueError
+        except Exception:raise ValueError("invalid vmess URI")
+    return config
+def brand_share_uri(config,name):
+    config=str(config).strip();scheme=config.split(":",1)[0].lower()
+    if scheme=="vmess":
+        try:
+            payload=config.split("#",1)[0][8:];parsed=json.loads(b64decode_loose(payload).decode());parsed["ps"]=name
+            encoded=base64.b64encode(json.dumps(parsed,ensure_ascii=False,separators=(",",":")).encode()).decode()
+            return "vmess://"+encoded
+        except Exception:return config
+    if scheme=="ssr":return config
+    cut=config.rfind("#");return (config[:cut] if cut>=0 else config)+"#"+urllib.parse.quote(name,safe="")
 
 BOT_USERNAME=""
 class Handler(BaseHTTPRequestHandler):
@@ -200,7 +227,8 @@ class Handler(BaseHTTPRequestHandler):
         m=re.fullmatch(r"/api/admin/tickets/(\d+)/close",path)
         if method=="POST" and m:dbx.run("update app_tickets set status='closed',updated_at=now() where id=:id",id=int(m.group(1)));return {"ok":True}
         if method=="GET" and path=="/api/admin/servers":return {"servers":[dict(zip(("id","name","enabled","sort"),r)) for r in dbx.run("select id,name,enabled,sort_order from app_servers order by sort_order,id")]}
-        if method=="POST" and path=="/api/admin/servers":server=int(dbx.run("insert into app_servers(name,config,sort_order) values(:name,:config,:sort) returning id",name=payload["name"][:100],config=payload["config"][:4000],sort=int(payload.get("sort",0)))[0][0]);return {"id":server}
+        if method=="POST" and path=="/api/admin/servers":
+            config=validate_share_uri(payload["config"]);server=int(dbx.run("insert into app_servers(name,config,sort_order) values(:name,:config,:sort) returning id",name=payload["name"][:100],config=config,sort=int(payload.get("sort",0)))[0][0]);return {"id":server,"protocol":config.split(":",1)[0].lower()}
         m=re.fullmatch(r"/api/admin/servers/(\d+)",path)
         if method=="DELETE" and m:dbx.run("delete from app_servers where id=:id",id=int(m.group(1)));return {"ok":True}
         if method=="POST" and path=="/api/admin/broadcast":
@@ -226,7 +254,7 @@ class Handler(BaseHTTPRequestHandler):
             else:dbx.run("insert into app_devices(telegram_id,device_hash,device_name,user_agent,last_ip) values(:id,:hash,:name,:agent,:ip)",id=user["telegram_id"],hash=fingerprint,name=device_name(agent),agent=agent[:300],ip=ip)
             servers=dbx.run("select name,config from app_servers where enabled=true order by sort_order,id");lines=[]
             for name,config in servers:
-                cut=config.rfind("#");lines.append((config[:cut] if cut>=0 else config)+"#"+name)
+                lines.append(brand_share_uri(config,name))
             sub_response(self,"\n".join(lines)+("\n" if lines else ""),user)
 
 def bot_loop():
