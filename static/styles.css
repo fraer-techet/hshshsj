@@ -6,3 +6,5 @@
 .danger-zone{border-color:#572525!important;color:#ff8e89!important}
 
 .incident{margin-bottom:14px;border-color:#6a4a22;background:#23190e}
+
+.client-connect{border:1px solid var(--line);border-radius:16px;padding:14px 12px;background:#151515;color:#fff;font-weight:800;display:flex;align-items:center;justify-content:center;gap:9px}.client-connect span{width:24px;height:24px;border-radius:8px;display:grid;place-items:center;background:#fff;color:#090909;font-size:12px}.client-connect.incy{background:linear-gradient(145deg,#171717,#101010)}.connect-note{font-size:11px;line-height:1.45;margin:10px 2px 0}
