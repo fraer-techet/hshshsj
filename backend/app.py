@@ -12,7 +12,7 @@ import urllib.parse
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import db, services
+from . import advanced, db, services
 from .auth import AuthError, verify_init_data
 from .config import ADMIN_ID, BRAND, CUSTOM_MAX_DAYS, CUSTOM_MIN_DAYS, FAMILY_DEVICE_LIMIT, FAMILY_PLANS, PLANS, PORT, PREMIUM_DEVICE_LIMIT, PUBLIC_URL, REFERRAL_DAYS, REFERRAL_PERCENT, REQUIRED_CHANNEL_URL, TRIAL_DAYS, TRIAL_DEVICE_LIMIT
 from .telegram import call as telegram_call, channel_keyboard, is_channel_member, miniapp_keyboard, send
@@ -47,7 +47,7 @@ def subscription_state(user):
     return {"active":active,"status":user["status"],"plan":user["plan"],"expiresAt":expires,"daysLeft":remaining,"trialUsed":user["trial_used"],"url":PUBLIC_URL+"/sub/"+user["sub_token"]}
 def bootstrap(dbx,user):
     servers=[{"id":r[0],"name":r[1]} for r in dbx.run("select id,name from app_servers where enabled=true order by sort_order,id")]
-    devices=[{"id":r[0],"name":r[1],"lastSeen":r[2]} for r in dbx.run("select id,device_name,last_seen from app_devices where telegram_id=:id and blocked=false order by last_seen desc",id=user["telegram_id"])]
+    devices=[{"id":r[0],"name":r[1],"lastSeen":r[2]} for r in dbx.run("select id,device_name,last_seen from app_devices where telegram_id=:id and blocked=false and approved=true order by last_seen desc",id=user["telegram_id"])]
     recent=[dict(zip(("id","kind","days","amount","method","status","createdAt"),r)) for r in dbx.run("select id,kind,days,amount,method,status,created_at from app_orders where telegram_id=:id order by created_at desc limit 10",id=user["telegram_id"])]
     return {"user":services.public_user(user),"subscription":subscription_state(user),"recentOrders":recent,"plans":[{"days":d,"price":p} for d,p in PLANS.items()],"familyPlans":[{"days":d,"price":p} for d,p in FAMILY_PLANS.items()],"custom":{"min":CUSTOM_MIN_DAYS,"max":CUSTOM_MAX_DAYS},"servers":servers,"devices":devices,"deviceLimit":TRIAL_DEVICE_LIMIT if user["status"]=="trial" else int(user.get("device_limit") or PREMIUM_DEVICE_LIMIT),"referral":{"days":REFERRAL_DAYS,"percent":REFERRAL_PERCENT,"url":"https://t.me/"+BOT_USERNAME+"?start=ref_"+user["referral_code"] if BOT_USERNAME else "ref_"+user["referral_code"]},"botUsername":BOT_USERNAME,"isAdmin":admin(user)}
 def dashboard(dbx):
@@ -177,8 +177,8 @@ class Handler(BaseHTTPRequestHandler):
         if method=="POST" and path=="/api/auto-renew":
             updated=services.set_auto_renew(dbx,uid,bool(payload.get("enabled")),int(payload.get("days",30)),payload.get("plan","premium"));return {"enabled":updated["auto_renew"],"days":updated["auto_renew_days"],"plan":updated["auto_renew_plan"]}
         if method=="GET" and path=="/api/diagnostics":
-            active_count=int(dbx.run("select count(*) from app_devices where telegram_id=:id and blocked=false",id=uid)[0][0]);server_count=int(dbx.run("select count(*) from app_servers where enabled=true")[0][0])
-            return {"subscription":db.active(user),"status":user["status"],"expiresAt":user.get("expires_at"),"devices":active_count,"deviceLimit":TRIAL_DEVICE_LIMIT if user["status"]=="trial" else int(user.get("device_limit") or PREMIUM_DEVICE_LIMIT),"servers":server_count,"channel":True}
+            active_count=int(dbx.run("select count(*) from app_devices where telegram_id=:id and blocked=false and approved=true",id=uid)[0][0]);server_count=int(dbx.run("select count(*) from app_servers where enabled=true")[0][0])
+            return {"subscription":db.active(user),"status":user["status"],"expiresAt":user.get("expires_at"),"devices":active_count,"deviceLimit":TRIAL_DEVICE_LIMIT if user["status"]=="trial" else int(user.get("device_limit") or PREMIUM_DEVICE_LIMIT),"servers":server_count,"channel":True,"autoRenew":bool(user.get("auto_renew")),"frozenUntil":user.get("frozen_until"),"clientReport":"ID "+str(uid)+" · "+str(active_count)+" devices · "+str(server_count)+" servers"}
         if method=="POST" and path=="/api/subscription/rotate":
             import secrets
             token=secrets.token_hex(24);dbx.run("update app_subscriptions set sub_token=:token where telegram_id=:id",token=token,id=uid);return {"url":PUBLIC_URL+"/sub/"+token}
@@ -202,6 +202,35 @@ class Handler(BaseHTTPRequestHandler):
                     try:send(int(owner[0][0]),f"💬 <b>Ответ поддержки · тикет #{ticket}</b>\n\n"+html.escape(payload["message"][:3000]),miniapp_keyboard(PUBLIC_URL+"/app"))
                     except Exception:pass
                 return {"ok":True}
+        if method=="GET" and path=="/api/balance/history":
+            rows=dbx.run("select amount,kind,description,created_at from app_balance_transactions where telegram_id=:id order by created_at desc limit 100",id=uid);return {"items":[dict(zip(("amount","kind","description","createdAt"),r)) for r in rows]}
+        if method=="POST" and path=="/api/balance/transfer":return advanced.transfer_balance(dbx,uid,payload["target"],payload["amount"])
+        if method=="GET" and path=="/api/gifts":
+            rows=dbx.run("select token,kind,value,cost,status,claimed_by,message,anonymous,created_at,expires_at from app_gifts where creator_id=:id order by created_at desc limit 100",id=uid);return {"gifts":[dict(zip(("token","kind","value","cost","status","claimedBy","message","anonymous","createdAt","expiresAt"),r)) for r in rows]}
+        m=re.fullmatch(r"/api/gifts/([A-Za-z0-9_-]+)/cancel",path)
+        if method=="POST" and m:dbx.run("update app_gifts set status='cancelled',cancelled_at=now() where token=:token and creator_id=:id and status='pending'",token=m.group(1),id=uid);return {"ok":True}
+        if method=="POST" and path=="/api/subscription/freeze":return advanced.freeze_subscription(dbx,uid,int(payload["days"]))
+        if method=="POST" and path=="/api/subscription/extra-device":return advanced.buy_extra_device(dbx,uid,int(payload.get("count",1)))
+        if method=="POST" and path=="/api/security/emergency":
+            import secrets
+            token=secrets.token_hex(24);dbx.run("update app_subscriptions set sub_token=:token where telegram_id=:id",token=token,id=uid);dbx.run("update app_devices set blocked=true where telegram_id=:id",id=uid);db.security_event(dbx,uid,"emergency_lock","All devices revoked");return {"ok":True,"url":PUBLIC_URL+"/sub/"+token}
+        if method=="GET" and path=="/api/security/events":
+            rows=dbx.run("select kind,details,ip,created_at from app_security_events where telegram_id=:id order by created_at desc limit 100",id=uid);return {"events":[dict(zip(("kind","details","ip","createdAt"),r)) for r in rows]}
+        if method=="GET" and path=="/api/knowledge":return {"articles":advanced.KNOWLEDGE}
+        if method=="GET" and path=="/api/news":
+            rows=dbx.run("select id,title,body,button_text,button_url,created_at from app_news where published=true order by created_at desc limit 30");return {"news":[dict(zip(("id","title","body","buttonText","buttonUrl","createdAt"),r)) for r in rows]}
+        if method=="GET" and path=="/api/tasks":
+            rows=dbx.run("select t.id,t.title,t.reward_kind,t.reward_value,exists(select 1 from app_bonus_completions c where c.task_id=t.id and c.telegram_id=:id) from app_bonus_tasks t where t.active=true order by t.id",id=uid);return {"tasks":[dict(zip(("id","title","rewardKind","rewardValue","completed"),r)) for r in rows]}
+        m=re.fullmatch(r"/api/tasks/(\d+)/claim",path)
+        if method=="POST" and m:return advanced.claim_task(dbx,user,int(m.group(1)),True)
+        if method=="GET" and path=="/api/votes":
+            rows=dbx.run("select country_code,country_name,count(*) from app_country_votes group by country_code,country_name order by count(*) desc");return {"countries":[{"code":code,"name":name,"votes":int(votes),"voted":bool(dbx.run('select 1 from app_country_votes where telegram_id=:id and country_code=:code',id=uid,code=code))} for code,name,votes in rows],"options":[{"code":c,"name":n} for c,n in advanced.COUNTRIES]}
+        if method=="POST" and path=="/api/votes":
+            code=str(payload["code"]).upper();name=dict(advanced.COUNTRIES).get(code)
+            if not name:raise ValueError("unknown country")
+            existing_vote=dbx.run("delete from app_country_votes where telegram_id=:id and country_code=:code returning country_code",id=uid,code=code)
+            if not existing_vote:dbx.run("insert into app_country_votes(telegram_id,country_code,country_name) values(:id,:code,:name)",id=uid,code=code,name=name)
+            return {"ok":True,"voted":not bool(existing_vote)}
         if path.startswith("/api/admin/"):
             if not admin(user):raise PermissionError("admin only")
             return self.admin_api(dbx,user,method,path,payload)
@@ -250,6 +279,25 @@ class Handler(BaseHTTPRequestHandler):
             config=validate_share_uri(payload["config"]);server=int(dbx.run("insert into app_servers(name,config,sort_order) values(:name,:config,:sort) returning id",name=payload["name"][:100],config=config,sort=int(payload.get("sort",0)))[0][0]);return {"id":server,"protocol":config.split(":",1)[0].lower()}
         m=re.fullmatch(r"/api/admin/servers/(\d+)",path)
         if method=="DELETE" and m:dbx.run("delete from app_servers where id=:id",id=int(m.group(1)));return {"ok":True}
+        if method=="POST" and path=="/api/admin/servers/import":
+            lines=[x.strip() for x in str(payload.get("configs","")).splitlines() if x.strip()];added=duplicates=invalid=0
+            for line in lines:
+                try:config=validate_share_uri(line)
+                except Exception:invalid+=1;continue
+                if dbx.run("select 1 from app_servers where config=:config",config=config):duplicates+=1;continue
+                fragment=urllib.parse.unquote(config.rsplit('#',1)[1])[:100] if '#' in config else "🌐 Импортированный сервер"
+                dbx.run("insert into app_servers(name,config,sort_order) values(:name,:config,5000)",name=fragment or "🌐 Импортированный сервер",config=config);added+=1
+            return {"added":added,"duplicates":duplicates,"invalid":invalid}
+        if method=="GET" and path=="/api/admin/finance":
+            return {"today":float(dbx.run("select coalesce(sum(amount),0) from app_payments where created_at>=date_trunc('day',now())")[0][0]),"month":float(dbx.run("select coalesce(sum(amount),0) from app_payments where created_at>=now()-interval '30 days'")[0][0]),"average":float(dbx.run("select coalesce(avg(amount),0) from app_payments")[0][0]),"balances":float(dbx.run("select coalesce(sum(balance),0) from app_users")[0][0]),"repeatBuyers":int(dbx.run("select count(*) from (select telegram_id from app_payments group by telegram_id having count(*)>1)x")[0][0])}
+        if method=="GET" and path=="/api/admin/system":
+            return {"database":"online","telegramPolling":"locked","servers":int(dbx.run("select count(*) from app_servers")[0][0]),"online":int(dbx.run("select count(*) from app_servers where health_status='online'")[0][0]),"offline":int(dbx.run("select count(*) from app_servers where health_status='offline'")[0][0]),"lastCheck":dbx.run("select max(last_checked_at) from app_servers")[0][0]}
+        if method=="POST" and path=="/api/admin/news":
+            news=int(dbx.run("insert into app_news(title,body,button_text,button_url) values(:title,:body,:bt,:bu) returning id",title=str(payload["title"])[:120],body=str(payload["body"])[:4000],bt=payload.get("buttonText"),bu=payload.get("buttonUrl"))[0][0]);return {"id":news}
+        if method=="POST" and path=="/api/admin/broadcasts/schedule":
+            when=payload.get("scheduledAt") or datetime.now(timezone.utc).isoformat();item=int(dbx.run("insert into app_broadcasts(admin_id,audience,message,button_text,button_url,scheduled_at) values(:admin,:audience,:message,:bt,:bu,:when) returning id",admin=uid,audience=payload.get("audience","all"),message=str(payload["message"])[:4000],bt=payload.get("buttonText"),bu=payload.get("buttonUrl"),when=when)[0][0]);return {"id":item}
+        if method=="GET" and path=="/api/admin/broadcasts":
+            rows=dbx.run("select id,audience,message,scheduled_at,status,sent,failed from app_broadcasts order by created_at desc limit 100");return {"broadcasts":[dict(zip(("id","audience","message","scheduledAt","status","sent","failed"),r)) for r in rows]}
         if method=="POST" and path=="/api/admin/broadcast":
             ok=failed=0
             for row in dbx.run("select telegram_id from app_users where banned=false"):
@@ -267,31 +315,40 @@ class Handler(BaseHTTPRequestHandler):
             if not vpn_client(agent):self.send_response(302);self.send_header("Location",PUBLIC_URL+"/app");self.end_headers();return
             forwarded=self.headers.get("X-Forwarded-For","");ip=(forwarded.split(",")[0] if forwarded else self.client_address[0])[:64]
             identity=device_identity(self,agent);fingerprint=device_hash(identity)
-            existing=dbx.run("select id,blocked from app_devices where telegram_id=:id and device_hash=:hash",id=user["telegram_id"],hash=fingerprint)
+            existing=dbx.run("select id,blocked,approved from app_devices where telegram_id=:id and device_hash=:hash",id=user["telegram_id"],hash=fingerprint)
             # Migrate old IP-based fingerprints and merge duplicates produced by changing mobile IPs.
             if not existing and identity.startswith("ua:"):
                 candidates=dbx.run("select id,device_hash,user_agent,blocked from app_devices where telegram_id=:id order by last_seen desc",id=user["telegram_id"])
                 matches=[row for row in candidates if normalize_agent(row[2])==normalize_agent(agent)]
                 blocked=next((row for row in matches if row[3]),None)
-                if blocked:existing=[(blocked[0],True)]
+                if blocked:existing=[(blocked[0],True,True)]
                 elif matches:
                     keep=matches[0];dbx.run("delete from app_devices where telegram_id=:id and id<>:keep and user_agent is not null and lower(split_part(user_agent,'/',1))=lower(split_part(:agent,'/',1))",id=user["telegram_id"],keep=keep[0],agent=agent[:300])
                     try:dbx.run("update app_devices set device_hash=:hash where id=:id",hash=fingerprint,id=keep[0])
                     except Exception:pass
-                    existing=[(keep[0],False)]
+                    existing=[(keep[0],False,True)]
             if existing and existing[0][1]:sub_response(self,dummy("FluxVPN | Устройство удалено"),user);return
+            if existing and not existing[0][2]:sub_response(self,dummy("FluxVPN | Подтвердите новое устройство в боте"),user);return
             limit=TRIAL_DEVICE_LIMIT if user["status"]=="trial" else int(user.get("device_limit") or PREMIUM_DEVICE_LIMIT)
-            if not existing and int(dbx.run("select count(*) from app_devices where telegram_id=:id and blocked=false",id=user["telegram_id"])[0][0])>=limit:sub_response(self,dummy("FluxVPN | Лимит устройств"),user);return
+            if not existing and int(dbx.run("select count(*) from app_devices where telegram_id=:id and blocked=false and approved=true",id=user["telegram_id"])[0][0])>=limit:sub_response(self,dummy("FluxVPN | Лимит устройств"),user);return
             if existing:dbx.run("update app_devices set last_seen=now(),last_ip=:ip,user_agent=:agent,device_name=:name where id=:id",ip=ip,agent=agent[:300],name=device_name(agent),id=existing[0][0])
-            else:dbx.run("insert into app_devices(telegram_id,device_hash,device_name,user_agent,last_ip) values(:id,:hash,:name,:agent,:ip)",id=user["telegram_id"],hash=fingerprint,name=device_name(agent),agent=agent[:300],ip=ip)
-            servers=dbx.run("select name,config from app_servers where enabled=true order by sort_order,id");lines=[]
+            else:
+                device=int(dbx.run("insert into app_devices(telegram_id,device_hash,device_name,user_agent,last_ip,approved) values(:id,:hash,:name,:agent,:ip,false) returning id",id=user["telegram_id"],hash=fingerprint,name=device_name(agent),agent=agent[:300],ip=ip)[0][0])
+                db.security_event(dbx,user["telegram_id"],"new_device",device_name(agent),ip)
+                try:send(user["telegram_id"],f"🔐 <b>Новое устройство</b>\n\n{html.escape(device_name(agent))} · <code>{html.escape(ip)}</code>\nРазрешить доступ?",{"inline_keyboard":[[{"text":"✅ Разрешить","callback_data":f"device_allow_{device}"},{"text":"⛔ Отклонить","callback_data":f"device_reject_{device}"}]]})
+                except Exception:pass
+                sub_response(self,dummy("FluxVPN | Подтвердите новое устройство в боте"),user);return
+            servers=dbx.run("select name,config from app_servers where enabled=true order by case health_status when 'online' then 0 when 'unknown' then 1 else 2 end,latency_ms is null,latency_ms,sort_order,id");lines=[]
+            for index,(name,config) in enumerate(servers[:4]):lines.append(brand_share_uri(config,("⭐ Автовыбор" if index==0 else "⚡ Быстрый резерв "+str(index))))
             for name,config in servers:
                 lines.append(brand_share_uri(config,name))
             sub_response(self,"\n".join(lines)+("\n" if lines else ""),user)
 
 def gift_message(result):
-    if result["kind"]=="subscription":return f"🎁 <b>Подарок FluxVPN</b>\n\nПодписка на <b>{int(result['value'])} дней</b>. Нажми кнопку, чтобы забрать."
-    return f"🎁 <b>Подарок FluxVPN</b>\n\nНа баланс: <b>{int(result['value'])} ₽</b>. Нажми кнопку, чтобы забрать."
+    sender="Анонимный подарок" if result.get("anonymous") else "Подарок FluxVPN"
+    note=("\n\n💌 "+html.escape(result["message"][:500])) if result.get("message") else ""
+    if result["kind"]=="subscription":return f"🎁 <b>{sender}</b>\n\nПодписка на <b>{int(result['value'])} дней</b>.{note}\n\nНажми кнопку, чтобы забрать."
+    return f"🎁 <b>{sender}</b>\n\nНа баланс: <b>{int(result['value'])} ₽</b>.{note}\n\nНажми кнопку, чтобы забрать."
 
 def claim_gift_for_user(source,token,chat_id):
     with db.session() as dbx:
@@ -306,9 +363,11 @@ def handle_inline_query(inline):
     source=inline["from"];uid=int(source["id"])
     if uid!=int(ADMIN_ID) and not is_channel_member(uid):
         telegram_call("answerInlineQuery",{"inline_query_id":inline["id"],"is_personal":True,"cache_time":0,"results":[{"type":"article","id":"join","title":"Сначала подпишись на FluxVPN","description":"После подписки открой меню ещё раз","input_message_content":{"message_text":"Подпишись на @fluxvvpn, чтобы отправлять подарки FluxVPN"},"reply_markup":{"inline_keyboard":[[{"text":"📢 Подписаться","url":REQUIRED_CHANNEL_URL}]]}}]});return
-    query=(inline.get("query") or "").strip().lower();options=[]
+    raw_query=(inline.get("query") or "").strip();query=raw_query.lower();options=[];anonymous="анон" in query or "anonymous" in query;gift_note=""
     if query:
         numbers=re.findall(r"\d+",query);value=int(numbers[0]) if numbers else 0
+        gift_note=re.sub(r"^(подписка|под|sub|days|дней|баланс|бал|balance|rub|₽)\s*\d+\s*", "", raw_query, flags=re.I)
+        gift_note=re.sub(r"\b(анон|anonymous)\b", "", gift_note, flags=re.I).strip()[:500]
         if query.startswith(("бал","balance","rub","₽")) and value in (50,100,200,500,1000):options=[("balance",value)]
         elif query.startswith(("под","sub","days","дн")) and CUSTOM_MIN_DAYS<=value<=CUSTOM_MAX_DAYS:options=[("subscription",value)]
     else:options=[("subscription",7),("subscription",30),("subscription",90),("balance",100),("balance",200),("balance",500)]
@@ -316,7 +375,7 @@ def handle_inline_query(inline):
     with db.session() as dbx:
         db.ensure_user(dbx,source)
         for kind,value in options:
-            gift=services.create_gift(dbx,uid,kind,value);link=f"https://t.me/{BOT_USERNAME}?start=gift_{gift['token']}"
+            gift=services.create_gift(dbx,uid,kind,value,gift_note,anonymous);link=f"https://t.me/{BOT_USERNAME}?start=gift_{gift['token']}"
             title=f"🎁 Подписка на {int(gift['value'])} дней" if kind=="subscription" else f"🎁 {int(gift['value'])} ₽ на баланс"
             results.append({"type":"article","id":gift["token"],"title":title,"description":f"Спишется {int(gift['cost'])} ₽ после получения","input_message_content":{"message_text":gift_message(gift),"parse_mode":"HTML"},"reply_markup":{"inline_keyboard":[[{"text":"🎁 Забрать подарок","url":link}]]}})
     if not results:results=[{"type":"article","id":"help","title":"Формат подарка","description":"Напиши: подписка 30 или баланс 100","input_message_content":{"message_text":"Для подарка напиши: подписка 30 или баланс 100"}}]
@@ -326,6 +385,14 @@ def handle_bot_update(update):
     inline=update.get("inline_query")
     if inline:handle_inline_query(inline);return
     callback=update.get("callback_query")
+    if callback and re.fullmatch(r"device_(allow|reject)_\d+",callback.get("data") or ""):
+        source=callback["from"];action,device=(callback["data"].split("_")[1],int(callback["data"].split("_")[2]))
+        with db.session() as dbx:
+            rows=dbx.run("select telegram_id,device_name from app_devices where id=:id",id=device)
+            if not rows or int(rows[0][0])!=int(source["id"]):telegram_call("answerCallbackQuery",{"callback_query_id":callback["id"],"text":"Устройство не найдено","show_alert":True});return
+            if action=="allow":dbx.run("update app_devices set approved=true,approved_at=now(),blocked=false where id=:id",id=device);db.security_event(dbx,source["id"],"device_approved",rows[0][1])
+            else:dbx.run("update app_devices set blocked=true where id=:id",id=device);db.security_event(dbx,source["id"],"device_rejected",rows[0][1])
+        telegram_call("answerCallbackQuery",{"callback_query_id":callback["id"],"text":"Устройство разрешено ✅" if action=="allow" else "Устройство отклонено"});return
     if callback and (callback.get("data") or "").startswith("check_channel_subscription"):
         source=callback["from"];joined=int(source["id"])==int(ADMIN_ID) or is_channel_member(source["id"]);data=callback.get("data") or ""
         telegram_call("answerCallbackQuery",{"callback_query_id":callback["id"],"text":"Подписка подтверждена ✅" if joined else "Сначала подпишись на канал","show_alert":not joined})

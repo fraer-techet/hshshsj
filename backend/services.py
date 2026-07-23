@@ -122,7 +122,7 @@ def redeem_promo(dbx,user,code):
     return {"kind":kind,"value":float(value)}
 
 
-def create_gift(dbx,creator_id,kind,value):
+def create_gift(dbx,creator_id,kind,value,message=None,anonymous=False,recipient_id=None):
     creator=db.get_user(dbx,creator_id)
     if not creator:raise ValueError("creator not found")
     if kind=="subscription":
@@ -136,17 +136,19 @@ def create_gift(dbx,creator_id,kind,value):
     if recent:token=recent[0][0]
     else:
         token=secrets.token_urlsafe(18)
-        dbx.run("insert into app_gifts(token,creator_id,kind,value,cost) values(:token,:creator,:kind,:value,:cost)",token=token,creator=int(creator_id),kind=kind,value=gift_value,cost=cost)
-    return {"token":token,"kind":kind,"value":gift_value,"cost":cost}
+        dbx.run("insert into app_gifts(token,creator_id,kind,value,cost,message,anonymous,recipient_id) values(:token,:creator,:kind,:value,:cost,:message,:anonymous,:recipient)",token=token,creator=int(creator_id),kind=kind,value=gift_value,cost=cost,message=(message or None),anonymous=bool(anonymous),recipient=recipient_id)
+    dbx.run("update app_gifts set message=:message,anonymous=:anonymous,recipient_id=:recipient where token=:token",message=(message or None),anonymous=bool(anonymous),recipient=recipient_id,token=token)
+    return {"token":token,"kind":kind,"value":gift_value,"cost":cost,"message":message,"anonymous":bool(anonymous)}
 
 def claim_gift(dbx,token,claimer_id):
     try:
         dbx.run("begin")
-        rows=dbx.run("select creator_id,kind,value,cost,status,expires_at from app_gifts where token=:token for update",token=token)
+        rows=dbx.run("select creator_id,kind,value,cost,status,expires_at,recipient_id from app_gifts where token=:token for update",token=token)
         if not rows:raise ValueError("Подарок не найден")
-        creator,kind,value,cost,status,expires=rows[0]
+        creator,kind,value,cost,status,expires,recipient_id=rows[0]
         if status!="pending":raise ValueError("Подарок уже использован")
         if int(creator)==int(claimer_id):raise ValueError("Нельзя забрать собственный подарок")
+        if recipient_id and int(recipient_id)!=int(claimer_id):raise ValueError("Этот подарок предназначен другому пользователю")
         if expires and expires<datetime.now(timezone.utc):raise ValueError("Срок подарка истёк")
         db.balance_change(dbx,creator,-float(cost),"gift_sent",f"Gift to {claimer_id}")
         if kind=="subscription":

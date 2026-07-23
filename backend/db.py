@@ -55,6 +55,30 @@ MIGRATIONS = [
 "create index if not exists app_gifts_creator_idx on app_gifts(creator_id,created_at desc)",
 "create index if not exists app_gifts_status_idx on app_gifts(status,expires_at)",
 ]),
+(15, "operations_security_growth", [
+"alter table app_servers add column if not exists health_status text not null default 'unknown'",
+"alter table app_servers add column if not exists latency_ms integer",
+"alter table app_servers add column if not exists failure_count integer not null default 0",
+"alter table app_servers add column if not exists last_checked_at timestamptz",
+"alter table app_devices add column if not exists approved boolean not null default true",
+"alter table app_devices add column if not exists approved_at timestamptz",
+"alter table app_subscriptions add column if not exists frozen_until timestamptz",
+"alter table app_subscriptions add column if not exists freeze_days_used integer not null default 0",
+"alter table app_subscriptions add column if not exists extra_devices integer not null default 0",
+"alter table app_gifts add column if not exists message text",
+"alter table app_gifts add column if not exists anonymous boolean not null default false",
+"alter table app_gifts add column if not exists recipient_id bigint",
+"alter table app_gifts add column if not exists cancelled_at timestamptz",
+"create table if not exists app_security_events(id bigserial primary key,telegram_id bigint not null references app_users(telegram_id),kind text not null,details text,ip text,created_at timestamptz not null default now())",
+"create index if not exists app_security_events_user_idx on app_security_events(telegram_id,created_at desc)",
+"create table if not exists app_broadcasts(id bigserial primary key,admin_id bigint not null,audience text not null default 'all',message text not null,button_text text,button_url text,scheduled_at timestamptz not null,status text not null default 'scheduled',sent integer not null default 0,failed integer not null default 0,created_at timestamptz not null default now(),finished_at timestamptz)",
+"create index if not exists app_broadcasts_due_idx on app_broadcasts(status,scheduled_at)",
+"create table if not exists app_news(id bigserial primary key,title text not null,body text not null,button_text text,button_url text,published boolean not null default true,created_at timestamptz not null default now())",
+"create table if not exists app_bonus_tasks(id bigserial primary key,code text not null unique,title text not null,reward_kind text not null,reward_value numeric(14,2) not null,condition_type text not null,active boolean not null default true,created_at timestamptz not null default now())",
+"create table if not exists app_bonus_completions(task_id bigint not null references app_bonus_tasks(id),telegram_id bigint not null references app_users(telegram_id),created_at timestamptz not null default now(),primary key(task_id,telegram_id))",
+"create table if not exists app_country_votes(telegram_id bigint not null references app_users(telegram_id),country_code text not null,country_name text not null,created_at timestamptz not null default now(),primary key(telegram_id,country_code))",
+"insert into app_bonus_tasks(code,title,reward_kind,reward_value,condition_type) values('channel','Подписка на канал FluxVPN','balance',10,'channel'),('first_purchase','Первая покупка Premium','days',2,'first_purchase'),('referral_purchase','Друг совершил покупку','balance',20,'referral_purchase') on conflict(code) do nothing",
+]),
 ]
 
 def connection():
@@ -204,13 +228,17 @@ def ensure_user(db,telegram_user,referral_code=None,allow_migrate=True):
     return get_user(db,user_id)
 
 def get_user(db,user_id):
-    rows=db.run("select u.telegram_id,u.username,u.first_name,u.last_name,u.language,u.balance,u.banned,u.ban_reason,u.referral_code,u.referred_by,u.referral_count,u.referral_earned,u.discount_percent,u.created_at,s.status,s.plan,s.expires_at,s.trial_used,s.sub_token,s.device_limit,s.auto_renew,s.auto_renew_days,s.auto_renew_plan from app_users u join app_subscriptions s using(telegram_id) where u.telegram_id=:id",id=int(user_id))
+    rows=db.run("select u.telegram_id,u.username,u.first_name,u.last_name,u.language,u.balance,u.banned,u.ban_reason,u.referral_code,u.referred_by,u.referral_count,u.referral_earned,u.discount_percent,u.created_at,s.status,s.plan,s.expires_at,s.trial_used,s.sub_token,s.device_limit,s.auto_renew,s.auto_renew_days,s.auto_renew_plan,s.frozen_until,s.freeze_days_used,s.extra_devices from app_users u join app_subscriptions s using(telegram_id) where u.telegram_id=:id",id=int(user_id))
     if not rows:return None
-    keys=("telegram_id","username","first_name","last_name","language","balance","banned","ban_reason","referral_code","referred_by","referral_count","referral_earned","discount_percent","created_at","status","plan","expires_at","trial_used","sub_token","device_limit","auto_renew","auto_renew_days","auto_renew_plan")
+    keys=("telegram_id","username","first_name","last_name","language","balance","banned","ban_reason","referral_code","referred_by","referral_count","referral_earned","discount_percent","created_at","status","plan","expires_at","trial_used","sub_token","device_limit","auto_renew","auto_renew_days","auto_renew_plan","frozen_until","freeze_days_used","extra_devices")
     return dict(zip(keys,rows[0]))
 def active(user):
     expires=user.get("expires_at")
     if user.get("status") not in ("trial","premium") or not expires:return False
+    frozen=user.get("frozen_until")
+    if frozen:
+        if frozen.tzinfo is None:frozen=frozen.replace(tzinfo=timezone.utc)
+        if frozen>datetime.now(timezone.utc):return False
     if expires.tzinfo is None:expires=expires.replace(tzinfo=timezone.utc)
     return expires>datetime.now(timezone.utc)
 def extend_subscription(db,user_id,days,plan="Premium",device_limit=None):
@@ -242,3 +270,7 @@ def reward_referrer(db,referred_id,order_id,amount):
         db.run("update app_users set referral_earned=referral_earned+:amount where telegram_id=:id",amount=reward,id=int(inviter))
         return reward
     return 0
+
+
+def security_event(db,user_id,kind,details=None,ip=None):
+    db.run("insert into app_security_events(telegram_id,kind,details,ip) values(:id,:kind,:details,:ip)",id=int(user_id),kind=kind,details=details,ip=ip)
