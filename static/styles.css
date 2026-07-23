@@ -2,3 +2,5 @@
 #loader .muted{display:block;max-width:290px;line-height:1.5;margin:0 auto}.gate-actions{width:min(290px,calc(100vw - 40px));margin:22px auto 0}
 
 .plan.family{border-color:#665b32;background:linear-gradient(145deg,#201d12,#111)}
+
+.danger-zone{border-color:#572525!important;color:#ff8e89!important}
