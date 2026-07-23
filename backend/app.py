@@ -14,8 +14,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import db, services
 from .auth import AuthError, verify_init_data
-from .config import ADMIN_ID, BRAND, CUSTOM_MAX_DAYS, CUSTOM_MIN_DAYS, PLANS, PORT, PREMIUM_DEVICE_LIMIT, PUBLIC_URL, REFERRAL_DAYS, REFERRAL_PERCENT, TRIAL_DAYS, TRIAL_DEVICE_LIMIT
-from .telegram import call as telegram_call, miniapp_keyboard, send
+from .config import ADMIN_ID, BRAND, CUSTOM_MAX_DAYS, CUSTOM_MIN_DAYS, PLANS, PORT, PREMIUM_DEVICE_LIMIT, PUBLIC_URL, REFERRAL_DAYS, REFERRAL_PERCENT, REQUIRED_CHANNEL_URL, TRIAL_DAYS, TRIAL_DEVICE_LIMIT
+from .telegram import call as telegram_call, channel_keyboard, is_channel_member, miniapp_keyboard, send
 
 ROOT=os.path.dirname(os.path.dirname(__file__));STATIC=os.path.join(ROOT,"static")
 
@@ -127,6 +127,8 @@ class Handler(BaseHTTPRequestHandler):
             with db.session() as dbx:
                 user=current(self,dbx);payload=body(self) if method=="POST" else {}
                 if user.get("banned") and not admin(user):self.reply(403,{"error":"banned","reason":user.get("ban_reason")});return
+                if not admin(user) and not is_channel_member(user["telegram_id"]):
+                    self.reply(403,{"error":"Подпишись на канал FluxVPN, чтобы продолжить","code":"CHANNEL_SUBSCRIPTION_REQUIRED","channelUrl":REQUIRED_CHANNEL_URL});return
                 result=self.api(dbx,user,method,path,payload);self.reply(200,result)
         except AuthError as error:self.reply(401,{"error":str(error)})
         except ValueError as error:self.reply(400,{"error":str(error)})
@@ -262,13 +264,24 @@ def bot_loop():
     me=telegram_call("getMe");BOT_USERNAME=me.get("username","");telegram_call("deleteWebhook",{"drop_pending_updates":False});offset=0
     while True:
         try:
-            updates=telegram_call("getUpdates",{"offset":offset,"timeout":50,"allowed_updates":["message"]},60)
+            updates=telegram_call("getUpdates",{"offset":offset,"timeout":50,"allowed_updates":["message","callback_query"]},60)
             for update in updates:
-                offset=update["update_id"]+1;message=update.get("message")
+                offset=update["update_id"]+1
+                callback=update.get("callback_query")
+                if callback and callback.get("data")=="check_channel_subscription":
+                    source=callback["from"];joined=int(source["id"])==int(ADMIN_ID) or is_channel_member(source["id"])
+                    telegram_call("answerCallbackQuery",{"callback_query_id":callback["id"],"text":"Подписка подтверждена ✅" if joined else "Сначала подпишись на канал","show_alert":not joined})
+                    if joined:
+                        message=callback.get("message") or {};username=source.get("username");name="@"+username if username else source.get("first_name","друг")
+                        send(message.get("chat",{}).get("id",source["id"]),f"Привет, <b>{html.escape(name)}</b>\n\nПодписка подтверждена ✅",miniapp_keyboard(PUBLIC_URL+"/app"))
+                    continue
+                message=update.get("message")
                 if not message or not (message.get("text") or "").startswith("/start"):continue
                 source=message["from"];username=source.get("username");name="@"+username if username else source.get("first_name","друг")
                 argument=(message.get("text") or "").split(maxsplit=1);ref=argument[1][4:] if len(argument)>1 and argument[1].startswith("ref_") else None
                 with db.session() as dbx:db.ensure_user(dbx,source,ref)
+                if int(source["id"])!=int(ADMIN_ID) and not is_channel_member(source["id"]):
+                    send(message["chat"]["id"],f"Привет, <b>{html.escape(name)}</b>\n\nЧтобы пользоваться FluxVPN, подпишись на наш канал и нажми «Проверить подписку».",channel_keyboard());continue
                 send(message["chat"]["id"],f"Привет, <b>{html.escape(name)}</b>",miniapp_keyboard(PUBLIC_URL+"/app"))
         except Exception:print("BOT",traceback.format_exc(),flush=True);time.sleep(3)
 def start():
