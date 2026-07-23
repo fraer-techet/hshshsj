@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import db, services
 from .auth import AuthError, verify_init_data
-from .config import ADMIN_ID, BRAND, CUSTOM_MAX_DAYS, CUSTOM_MIN_DAYS, PLANS, PORT, PREMIUM_DEVICE_LIMIT, PUBLIC_URL, REFERRAL_DAYS, REFERRAL_PERCENT, REQUIRED_CHANNEL_URL, TRIAL_DAYS, TRIAL_DEVICE_LIMIT
+from .config import ADMIN_ID, BRAND, CUSTOM_MAX_DAYS, CUSTOM_MIN_DAYS, FAMILY_DEVICE_LIMIT, FAMILY_PLANS, PLANS, PORT, PREMIUM_DEVICE_LIMIT, PUBLIC_URL, REFERRAL_DAYS, REFERRAL_PERCENT, REQUIRED_CHANNEL_URL, TRIAL_DAYS, TRIAL_DEVICE_LIMIT
 from .telegram import call as telegram_call, channel_keyboard, is_channel_member, miniapp_keyboard, send
 
 ROOT=os.path.dirname(os.path.dirname(__file__));STATIC=os.path.join(ROOT,"static")
@@ -49,17 +49,27 @@ def bootstrap(dbx,user):
     servers=[{"id":r[0],"name":r[1]} for r in dbx.run("select id,name from app_servers where enabled=true order by sort_order,id")]
     devices=[{"id":r[0],"name":r[1],"lastSeen":r[2]} for r in dbx.run("select id,device_name,last_seen from app_devices where telegram_id=:id and blocked=false order by last_seen desc",id=user["telegram_id"])]
     recent=[dict(zip(("id","kind","days","amount","method","status","createdAt"),r)) for r in dbx.run("select id,kind,days,amount,method,status,created_at from app_orders where telegram_id=:id order by created_at desc limit 10",id=user["telegram_id"])]
-    return {"user":services.public_user(user),"subscription":subscription_state(user),"recentOrders":recent,"plans":[{"days":d,"price":p} for d,p in PLANS.items()],"custom":{"min":CUSTOM_MIN_DAYS,"max":CUSTOM_MAX_DAYS},"servers":servers,"devices":devices,"deviceLimit":TRIAL_DEVICE_LIMIT if user["status"]=="trial" else PREMIUM_DEVICE_LIMIT,"referral":{"days":REFERRAL_DAYS,"percent":REFERRAL_PERCENT,"url":"https://t.me/"+BOT_USERNAME+"?start=ref_"+user["referral_code"] if BOT_USERNAME else "ref_"+user["referral_code"]},"isAdmin":admin(user)}
+    return {"user":services.public_user(user),"subscription":subscription_state(user),"recentOrders":recent,"plans":[{"days":d,"price":p} for d,p in PLANS.items()],"familyPlans":[{"days":d,"price":p} for d,p in FAMILY_PLANS.items()],"custom":{"min":CUSTOM_MIN_DAYS,"max":CUSTOM_MAX_DAYS},"servers":servers,"devices":devices,"deviceLimit":TRIAL_DEVICE_LIMIT if user["status"]=="trial" else int(user.get("device_limit") or PREMIUM_DEVICE_LIMIT),"referral":{"days":REFERRAL_DAYS,"percent":REFERRAL_PERCENT,"url":"https://t.me/"+BOT_USERNAME+"?start=ref_"+user["referral_code"] if BOT_USERNAME else "ref_"+user["referral_code"]},"botUsername":BOT_USERNAME,"isAdmin":admin(user)}
 def dashboard(dbx):
     scalar=lambda sql:float(dbx.run(sql)[0][0] or 0)
-    return {"users":int(scalar("select count(*) from app_users")),"active":int(scalar("select count(*) from app_subscriptions where expires_at>now()")),"orders":int(scalar("select count(*) from app_orders")),"pending":int(scalar("select count(*) from app_orders where status='pending'")),"tickets":int(scalar("select count(*) from app_tickets where status='open'")),"servers":int(scalar("select count(*) from app_servers where enabled=true")),"revenue":scalar("select coalesce(sum(amount),0) from app_payments"),"today":scalar("select coalesce(sum(amount),0) from app_payments where created_at>=date_trunc('day',now())"),"week":scalar("select coalesce(sum(amount),0) from app_payments where created_at>=now()-interval '7 days'"),"month":scalar("select coalesce(sum(amount),0) from app_payments where created_at>=now()-interval '30 days'")}
+    return {"users":int(scalar("select count(*) from app_users")),"active":int(scalar("select count(*) from app_subscriptions where expires_at>now()")),"orders":int(scalar("select count(*) from app_orders")),"pending":int(scalar("select count(*) from app_orders where status='pending'")),"tickets":int(scalar("select count(*) from app_tickets where status='open'")),"servers":int(scalar("select count(*) from app_servers where enabled=true")),"revenue":scalar("select coalesce(sum(amount),0) from app_payments"),"today":scalar("select coalesce(sum(amount),0) from app_payments where created_at>=date_trunc('day',now())"),"week":scalar("select coalesce(sum(amount),0) from app_payments where created_at>=now()-interval '7 days'"),"month":scalar("select coalesce(sum(amount),0) from app_payments where created_at>=now()-interval '30 days'"),"family":int(scalar("select count(*) from app_subscriptions where plan='Family' and expires_at>now()")),"autoRenew":int(scalar("select count(*) from app_subscriptions where auto_renew=true")),"gifts":int(scalar("select count(*) from app_gifts where status='claimed'"))}
 def user_details(dbx,user_id):
     user=db.get_user(dbx,user_id)
     if not user:return None
     orders=[dict(zip(("id","days","amount","method","status","createdAt"),r)) for r in dbx.run("select id,days,amount,method,status,created_at from app_orders where telegram_id=:id order by created_at desc limit 30",id=user_id)]
     return {"user":services.public_user(user),"subscription":subscription_state(user),"orders":orders}
 
-def device_hash(agent,ip):return hashlib.sha256(((agent or "")+"|"+(ip or "")).encode()).hexdigest()[:32]
+def normalize_agent(agent):
+    value=(agent or "unknown").lower().strip()
+    value=re.sub(r"(?<=[/ ])v?\d+(?:\.\d+){0,4}","",value)
+    value=re.sub(r"\s+"," ",value)
+    return value[:240]
+def device_hash(value):return hashlib.sha256((value or "unknown").encode()).hexdigest()[:32]
+def device_identity(handler,agent):
+    for header in ("X-Device-ID","X-Client-ID","Device-ID","X-Installation-ID","X-Hwid"):
+        value=(handler.headers.get(header) or "").strip()
+        if value:return "id:"+value[:200]
+    return "ua:"+normalize_agent(agent)
 def device_name(agent):
     lower=(agent or "").lower()
     for mark,name in (("happ","Happ"),("hiddify","Hiddify"),("v2ray","v2rayNG"),("clash","Clash"),("shadowrocket","Shadowrocket"),("streisand","Streisand"),("nekobox","NekoBox"),("sing-box","sing-box")):
@@ -145,7 +155,7 @@ class Handler(BaseHTTPRequestHandler):
             if user["trial_used"]:raise ValueError("trial already used")
             if db.active(user):raise ValueError("subscription already active")
             expires=datetime.now(timezone.utc)+timedelta(days=TRIAL_DAYS);dbx.run("update app_subscriptions set status='trial',plan='Trial',trial_used=true,expires_at=:expires where telegram_id=:id",expires=expires,id=uid);return bootstrap(dbx,db.get_user(dbx,uid))
-        if method=="POST" and path=="/api/quote":return services.checkout(dbx,user,int(payload["days"]),payload.get("promoCode"))
+        if method=="POST" and path=="/api/quote":return services.checkout(dbx,user,int(payload["days"]),payload.get("promoCode"),payload.get("plan","premium"))
         if method=="POST" and path=="/api/topups":
             result=services.create_topup(dbx,user,float(payload["amount"]),payload["method"])
             if payload["method"]=="manual":
@@ -153,7 +163,7 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:pass
             return result
         if method=="POST" and path=="/api/orders":
-            result=services.create_order(dbx,user,int(payload["days"]),payload["method"],payload.get("promoCode"))
+            result=services.create_order(dbx,user,int(payload["days"]),payload["method"],payload.get("promoCode"),payload.get("plan","premium"))
             if payload["method"]=="manual":
                 try:send(ADMIN_ID,f"🛒 <b>Новый заказ #{result['order_id']}</b>\n<code>{uid}</code> · {result['days']} дней · {result['amount']} ₽",miniapp_keyboard(PUBLIC_URL+"/app"))
                 except Exception:pass
@@ -164,6 +174,11 @@ class Handler(BaseHTTPRequestHandler):
             if not rows or (int(rows[0][0])!=uid and not admin(user)):raise PermissionError("not your order")
             return {"status":services.check_crypto_order(dbx,order_id)}
         if method=="POST" and path=="/api/promos/redeem":return services.redeem_promo(dbx,user,payload["code"])
+        if method=="POST" and path=="/api/auto-renew":
+            updated=services.set_auto_renew(dbx,uid,bool(payload.get("enabled")),int(payload.get("days",30)),payload.get("plan","premium"));return {"enabled":updated["auto_renew"],"days":updated["auto_renew_days"],"plan":updated["auto_renew_plan"]}
+        if method=="GET" and path=="/api/diagnostics":
+            active_count=int(dbx.run("select count(*) from app_devices where telegram_id=:id and blocked=false",id=uid)[0][0]);server_count=int(dbx.run("select count(*) from app_servers where enabled=true")[0][0])
+            return {"subscription":db.active(user),"status":user["status"],"expiresAt":user.get("expires_at"),"devices":active_count,"deviceLimit":TRIAL_DEVICE_LIMIT if user["status"]=="trial" else int(user.get("device_limit") or PREMIUM_DEVICE_LIMIT),"servers":server_count,"channel":True}
         if method=="POST" and path=="/api/subscription/rotate":
             import secrets
             token=secrets.token_hex(24);dbx.run("update app_subscriptions set sub_token=:token where telegram_id=:id",token=token,id=uid);return {"url":PUBLIC_URL+"/sub/"+token}
@@ -225,6 +240,8 @@ class Handler(BaseHTTPRequestHandler):
             code=payload["code"].strip().upper();kind=payload["kind"]
             if kind not in ("days","balance","percent","fixed"):raise ValueError("invalid promo kind")
             dbx.run("insert into app_promos(code,kind,value,max_uses) values(:code,:kind,:value,:uses) on conflict(code) do update set kind=:kind,value=:value,max_uses=:uses,active=true,updated_at=now()",code=code,kind=kind,value=float(payload["value"]),uses=int(payload.get("maxUses",100)));db.audit(dbx,user["telegram_id"],"promo_save","promo",code);return {"ok":True}
+        if method=="GET" and path=="/api/admin/gifts":
+            rows=dbx.run("select token,creator_id,kind,value,cost,status,claimed_by,created_at,expires_at from app_gifts order by created_at desc limit 200");return {"gifts":[dict(zip(("token","creatorId","kind","value","cost","status","claimedBy","createdAt","expiresAt"),r)) for r in rows]}
         if method=="GET" and path=="/api/admin/tickets":return {"tickets":[dict(zip(("id","userId","category","subject","status","updatedAt"),r)) for r in dbx.run("select id,telegram_id,category,subject,status,updated_at from app_tickets order by updated_at desc limit 200")]}
         m=re.fullmatch(r"/api/admin/tickets/(\d+)/close",path)
         if method=="POST" and m:dbx.run("update app_tickets set status='closed',updated_at=now() where id=:id",id=int(m.group(1)));return {"ok":True}
@@ -248,16 +265,90 @@ class Handler(BaseHTTPRequestHandler):
             user=db.get_user(dbx,rows[0][0]);agent=self.headers.get("User-Agent","")
             if not db.active(user) or user.get("banned"):sub_response(self,dummy("FluxVPN | Подписка истекла"),user);return
             if not vpn_client(agent):self.send_response(302);self.send_header("Location",PUBLIC_URL+"/app");self.end_headers();return
-            forwarded=self.headers.get("X-Forwarded-For","");ip=(forwarded.split(",")[0] if forwarded else self.client_address[0])[:64];fingerprint=device_hash(agent,ip);existing=dbx.run("select id,blocked from app_devices where telegram_id=:id and device_hash=:hash",id=user["telegram_id"],hash=fingerprint)
+            forwarded=self.headers.get("X-Forwarded-For","");ip=(forwarded.split(",")[0] if forwarded else self.client_address[0])[:64]
+            identity=device_identity(self,agent);fingerprint=device_hash(identity)
+            existing=dbx.run("select id,blocked from app_devices where telegram_id=:id and device_hash=:hash",id=user["telegram_id"],hash=fingerprint)
+            # Migrate old IP-based fingerprints and merge duplicates produced by changing mobile IPs.
+            if not existing and identity.startswith("ua:"):
+                candidates=dbx.run("select id,device_hash,user_agent,blocked from app_devices where telegram_id=:id order by last_seen desc",id=user["telegram_id"])
+                matches=[row for row in candidates if normalize_agent(row[2])==normalize_agent(agent)]
+                blocked=next((row for row in matches if row[3]),None)
+                if blocked:existing=[(blocked[0],True)]
+                elif matches:
+                    keep=matches[0];dbx.run("delete from app_devices where telegram_id=:id and id<>:keep and user_agent is not null and lower(split_part(user_agent,'/',1))=lower(split_part(:agent,'/',1))",id=user["telegram_id"],keep=keep[0],agent=agent[:300])
+                    try:dbx.run("update app_devices set device_hash=:hash where id=:id",hash=fingerprint,id=keep[0])
+                    except Exception:pass
+                    existing=[(keep[0],False)]
             if existing and existing[0][1]:sub_response(self,dummy("FluxVPN | Устройство удалено"),user);return
-            limit=TRIAL_DEVICE_LIMIT if user["status"]=="trial" else PREMIUM_DEVICE_LIMIT
+            limit=TRIAL_DEVICE_LIMIT if user["status"]=="trial" else int(user.get("device_limit") or PREMIUM_DEVICE_LIMIT)
             if not existing and int(dbx.run("select count(*) from app_devices where telegram_id=:id and blocked=false",id=user["telegram_id"])[0][0])>=limit:sub_response(self,dummy("FluxVPN | Лимит устройств"),user);return
-            if existing:dbx.run("update app_devices set last_seen=now(),last_ip=:ip,user_agent=:agent where id=:id",ip=ip,agent=agent[:300],id=existing[0][0])
+            if existing:dbx.run("update app_devices set last_seen=now(),last_ip=:ip,user_agent=:agent,device_name=:name where id=:id",ip=ip,agent=agent[:300],name=device_name(agent),id=existing[0][0])
             else:dbx.run("insert into app_devices(telegram_id,device_hash,device_name,user_agent,last_ip) values(:id,:hash,:name,:agent,:ip)",id=user["telegram_id"],hash=fingerprint,name=device_name(agent),agent=agent[:300],ip=ip)
             servers=dbx.run("select name,config from app_servers where enabled=true order by sort_order,id");lines=[]
             for name,config in servers:
                 lines.append(brand_share_uri(config,name))
             sub_response(self,"\n".join(lines)+("\n" if lines else ""),user)
+
+def gift_message(result):
+    if result["kind"]=="subscription":return f"🎁 <b>Подарок FluxVPN</b>\n\nПодписка на <b>{int(result['value'])} дней</b>. Нажми кнопку, чтобы забрать."
+    return f"🎁 <b>Подарок FluxVPN</b>\n\nНа баланс: <b>{int(result['value'])} ₽</b>. Нажми кнопку, чтобы забрать."
+
+def claim_gift_for_user(source,token,chat_id):
+    with db.session() as dbx:
+        db.ensure_user(dbx,source)
+        result=services.claim_gift(dbx,token,int(source["id"]))
+    text=f"🎉 Подарок получен: {int(result['value'])} дней подписки" if result["kind"]=="subscription" else f"🎉 На баланс зачислено {int(result['value'])} ₽"
+    send(chat_id,text,miniapp_keyboard(PUBLIC_URL+"/app"))
+    try:send(result["creator"],f"🎁 Твой подарок забрали. С баланса списано <b>{int(result['value'])} ₽</b>." if result["kind"]=="balance" else f"🎁 Твой подарок на <b>{int(result['value'])} дней</b> забрали.")
+    except Exception:pass
+
+def handle_inline_query(inline):
+    source=inline["from"];uid=int(source["id"])
+    if uid!=int(ADMIN_ID) and not is_channel_member(uid):
+        telegram_call("answerInlineQuery",{"inline_query_id":inline["id"],"is_personal":True,"cache_time":0,"results":[{"type":"article","id":"join","title":"Сначала подпишись на FluxVPN","description":"После подписки открой меню ещё раз","input_message_content":{"message_text":"Подпишись на @fluxvvpn, чтобы отправлять подарки FluxVPN"},"reply_markup":{"inline_keyboard":[[{"text":"📢 Подписаться","url":REQUIRED_CHANNEL_URL}]]}}]});return
+    query=(inline.get("query") or "").strip().lower();options=[]
+    if query:
+        numbers=re.findall(r"\d+",query);value=int(numbers[0]) if numbers else 0
+        if query.startswith(("бал","balance","rub","₽")) and value in (50,100,200,500,1000):options=[("balance",value)]
+        elif query.startswith(("под","sub","days","дн")) and CUSTOM_MIN_DAYS<=value<=CUSTOM_MAX_DAYS:options=[("subscription",value)]
+    else:options=[("subscription",7),("subscription",30),("subscription",90),("balance",100),("balance",200),("balance",500)]
+    results=[]
+    with db.session() as dbx:
+        db.ensure_user(dbx,source)
+        for kind,value in options:
+            gift=services.create_gift(dbx,uid,kind,value);link=f"https://t.me/{BOT_USERNAME}?start=gift_{gift['token']}"
+            title=f"🎁 Подписка на {int(gift['value'])} дней" if kind=="subscription" else f"🎁 {int(gift['value'])} ₽ на баланс"
+            results.append({"type":"article","id":gift["token"],"title":title,"description":f"Спишется {int(gift['cost'])} ₽ после получения","input_message_content":{"message_text":gift_message(gift),"parse_mode":"HTML"},"reply_markup":{"inline_keyboard":[[{"text":"🎁 Забрать подарок","url":link}]]}})
+    if not results:results=[{"type":"article","id":"help","title":"Формат подарка","description":"Напиши: подписка 30 или баланс 100","input_message_content":{"message_text":"Для подарка напиши: подписка 30 или баланс 100"}}]
+    telegram_call("answerInlineQuery",{"inline_query_id":inline["id"],"is_personal":True,"cache_time":0,"results":results})
+
+def handle_bot_update(update):
+    inline=update.get("inline_query")
+    if inline:handle_inline_query(inline);return
+    callback=update.get("callback_query")
+    if callback and (callback.get("data") or "").startswith("check_channel_subscription"):
+        source=callback["from"];joined=int(source["id"])==int(ADMIN_ID) or is_channel_member(source["id"]);data=callback.get("data") or ""
+        telegram_call("answerCallbackQuery",{"callback_query_id":callback["id"],"text":"Подписка подтверждена ✅" if joined else "Сначала подпишись на канал","show_alert":not joined})
+        if joined:
+            message=callback.get("message") or {};chat_id=message.get("chat",{}).get("id",source["id"])
+            if "|gift_" in data:
+                try:claim_gift_for_user(source,data.split("|gift_",1)[1],chat_id)
+                except Exception as error:send(chat_id,"Не удалось получить подарок: "+html.escape(str(error)))
+            else:send(chat_id,"Подписка подтверждена ✅",miniapp_keyboard(PUBLIC_URL+"/app"))
+        return
+    message=update.get("message")
+    if not message or not (message.get("text") or "").startswith("/start"):return
+    source=message["from"];username=source.get("username");name="@"+username if username else source.get("first_name","друг");parts=(message.get("text") or "").split(maxsplit=1);argument=parts[1] if len(parts)>1 else "";ref=argument[4:] if argument.startswith("ref_") else None
+    with db.session() as dbx:db.ensure_user(dbx,source,ref)
+    gift_token=argument[5:] if argument.startswith("gift_") else None
+    if int(source["id"])!=int(ADMIN_ID) and not is_channel_member(source["id"]):
+        callback_data="check_channel_subscription"+("|gift_"+gift_token if gift_token else "")
+        send(message["chat"]["id"],f"Привет, <b>{html.escape(name)}</b>\n\nЧтобы пользоваться FluxVPN, подпишись на канал и нажми «Проверить подписку».",channel_keyboard(True,callback_data));return
+    if gift_token:
+        try:claim_gift_for_user(source,gift_token,message["chat"]["id"])
+        except Exception as error:send(message["chat"]["id"],"Не удалось получить подарок: "+html.escape(str(error)))
+        return
+    send(message["chat"]["id"],f"Привет, <b>{html.escape(name)}</b>",miniapp_keyboard(PUBLIC_URL+"/app"))
 
 def bot_loop():
     global BOT_USERNAME
@@ -265,34 +356,17 @@ def bot_loop():
     while True:
         lock_db=None
         try:
-            lock_db=db.connection()
-            announced=False
+            lock_db=db.connection();announced=False
             while not bool(lock_db.run("select pg_try_advisory_lock(:key)",key=lock_key)[0][0]):
                 if not announced:print("BOT polling standby: another instance is active",flush=True);announced=True
                 time.sleep(5)
-            print("BOT polling lock acquired",flush=True)
-            me=telegram_call("getMe");BOT_USERNAME=me.get("username","");telegram_call("deleteWebhook",{"drop_pending_updates":False});offset=0
+            print("BOT polling lock acquired",flush=True);me=telegram_call("getMe");BOT_USERNAME=me.get("username","");telegram_call("deleteWebhook",{"drop_pending_updates":False});offset=0
             while True:
-                updates=telegram_call("getUpdates",{"offset":offset,"timeout":50,"allowed_updates":["message","callback_query"]},60)
-                lock_db.run("select 1")
+                updates=telegram_call("getUpdates",{"offset":offset,"timeout":50,"allowed_updates":["message","callback_query","inline_query"]},60);lock_db.run("select 1")
                 for update in updates:
                     offset=update["update_id"]+1
-                    callback=update.get("callback_query")
-                    if callback and callback.get("data")=="check_channel_subscription":
-                        source=callback["from"];joined=int(source["id"])==int(ADMIN_ID) or is_channel_member(source["id"])
-                        telegram_call("answerCallbackQuery",{"callback_query_id":callback["id"],"text":"Подписка подтверждена ✅" if joined else "Сначала подпишись на канал","show_alert":not joined})
-                        if joined:
-                            message=callback.get("message") or {};username=source.get("username");name="@"+username if username else source.get("first_name","друг")
-                            send(message.get("chat",{}).get("id",source["id"]),f"Привет, <b>{html.escape(name)}</b>\n\nПодписка подтверждена ✅",miniapp_keyboard(PUBLIC_URL+"/app"))
-                        continue
-                    message=update.get("message")
-                    if not message or not (message.get("text") or "").startswith("/start"):continue
-                    source=message["from"];username=source.get("username");name="@"+username if username else source.get("first_name","друг")
-                    argument=(message.get("text") or "").split(maxsplit=1);ref=argument[1][4:] if len(argument)>1 and argument[1].startswith("ref_") else None
-                    with db.session() as dbx:db.ensure_user(dbx,source,ref)
-                    if int(source["id"])!=int(ADMIN_ID) and not is_channel_member(source["id"]):
-                        send(message["chat"]["id"],f"Привет, <b>{html.escape(name)}</b>\n\nЧтобы пользоваться FluxVPN, подпишись на наш канал и нажми «Проверить подписку».",channel_keyboard());continue
-                    send(message["chat"]["id"],f"Привет, <b>{html.escape(name)}</b>",miniapp_keyboard(PUBLIC_URL+"/app"))
+                    try:handle_bot_update(update)
+                    except Exception:print("BOT UPDATE",traceback.format_exc(),flush=True)
         except Exception:print("BOT",traceback.format_exc(),flush=True);time.sleep(5)
         finally:
             if lock_db is not None:

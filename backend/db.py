@@ -45,6 +45,16 @@ MIGRATIONS = [
 (10, "remove_json_profiles", [
 "drop table if exists app_json_configs",
 ]),
+(13, "devices_gifts_family_autorenew", [
+"alter table app_subscriptions add column if not exists device_limit integer not null default 4",
+"alter table app_subscriptions add column if not exists auto_renew boolean not null default false",
+"alter table app_subscriptions add column if not exists auto_renew_days integer not null default 30",
+"alter table app_subscriptions add column if not exists auto_renew_plan text not null default 'premium'",
+"alter table app_orders add column if not exists plan_code text not null default 'premium'",
+"create table if not exists app_gifts(token text primary key,creator_id bigint not null references app_users(telegram_id),kind text not null,value numeric(14,2) not null,cost numeric(14,2) not null,status text not null default 'pending',claimed_by bigint references app_users(telegram_id),created_at timestamptz not null default now(),claimed_at timestamptz,expires_at timestamptz not null default now()+interval '7 days')",
+"create index if not exists app_gifts_creator_idx on app_gifts(creator_id,created_at desc)",
+"create index if not exists app_gifts_status_idx on app_gifts(status,expires_at)",
+]),
 ]
 
 def connection():
@@ -126,13 +136,13 @@ def seed_server_catalog_2(db):
         raise
 
 def seed_server_catalog_3(db):
-    marker = 12
+    marker = 14
     if db.run("select 1 from app_schema_migrations where version=:version", version=marker):
         return
     from .server_catalog_3 import SERVER_CATALOG_3
     try:
         db.run("begin")
-        db.run("delete from app_servers where seed_key like 'batch3-%'")
+        db.run("delete from app_servers where seed_key like 'batch3-%' or seed_key like 'batch4-%'")
         for sort_order, (seed_key, name, config) in enumerate(SERVER_CATALOG_3, start=2000):
             db.run(
                 "insert into app_servers(name,config,enabled,sort_order,seed_key) "
@@ -140,7 +150,7 @@ def seed_server_catalog_3(db):
                 "where not exists (select 1 from app_servers where seed_key=:key or config=:config)",
                 name=name, config=config, sort=sort_order, key=seed_key,
             )
-        db.run("insert into app_schema_migrations(version,name) values(:version,'server_catalog_curated_replacement')", version=marker)
+        db.run("insert into app_schema_migrations(version,name) values(:version,'server_catalog_top100_replacement')", version=marker)
         db.run("commit")
     except Exception:
         try:
@@ -188,27 +198,26 @@ def ensure_user(db,telegram_user,referral_code=None,allow_migrate=True):
         db.run("insert into app_subscriptions(telegram_id,sub_token) values(:id,:token)",id=user_id,token=secrets.token_hex(24))
         if inviter:
             db.run("update app_users set referral_count=referral_count+1 where telegram_id=:id",id=inviter)
-            extend_subscription(db,inviter,REFERRAL_DAYS,"Referral bonus")
-            db.run("insert into app_referral_rewards(inviter_id,referred_id,kind,days) values(:inviter,:referred,'signup',:days) on conflict do nothing",inviter=inviter,referred=user_id,days=REFERRAL_DAYS)
+            # Referral is registered now; rewards unlock only after the first paid purchase.
     else:
         db.run("update app_users set username=:username,first_name=:first,last_name=:last,updated_at=now() where telegram_id=:id",username=telegram_user.get("username"),first=telegram_user.get("first_name"),last=telegram_user.get("last_name"),id=user_id)
     return get_user(db,user_id)
 
 def get_user(db,user_id):
-    rows=db.run("select u.telegram_id,u.username,u.first_name,u.last_name,u.language,u.balance,u.banned,u.ban_reason,u.referral_code,u.referred_by,u.referral_count,u.referral_earned,u.discount_percent,u.created_at,s.status,s.plan,s.expires_at,s.trial_used,s.sub_token from app_users u join app_subscriptions s using(telegram_id) where u.telegram_id=:id",id=int(user_id))
+    rows=db.run("select u.telegram_id,u.username,u.first_name,u.last_name,u.language,u.balance,u.banned,u.ban_reason,u.referral_code,u.referred_by,u.referral_count,u.referral_earned,u.discount_percent,u.created_at,s.status,s.plan,s.expires_at,s.trial_used,s.sub_token,s.device_limit,s.auto_renew,s.auto_renew_days,s.auto_renew_plan from app_users u join app_subscriptions s using(telegram_id) where u.telegram_id=:id",id=int(user_id))
     if not rows:return None
-    keys=("telegram_id","username","first_name","last_name","language","balance","banned","ban_reason","referral_code","referred_by","referral_count","referral_earned","discount_percent","created_at","status","plan","expires_at","trial_used","sub_token")
+    keys=("telegram_id","username","first_name","last_name","language","balance","banned","ban_reason","referral_code","referred_by","referral_count","referral_earned","discount_percent","created_at","status","plan","expires_at","trial_used","sub_token","device_limit","auto_renew","auto_renew_days","auto_renew_plan")
     return dict(zip(keys,rows[0]))
 def active(user):
     expires=user.get("expires_at")
     if user.get("status") not in ("trial","premium") or not expires:return False
     if expires.tzinfo is None:expires=expires.replace(tzinfo=timezone.utc)
     return expires>datetime.now(timezone.utc)
-def extend_subscription(db,user_id,days,plan="Premium"):
+def extend_subscription(db,user_id,days,plan="Premium",device_limit=None):
     user=get_user(db,user_id);now=datetime.now(timezone.utc);base=now
     if active(user) and user["expires_at"]>now:base=user["expires_at"]
     expires=base+timedelta(days=int(days))
-    db.run("update app_subscriptions set status='premium',plan=:plan,expires_at=:expires,updated_at=now() where telegram_id=:id",plan=plan,expires=expires,id=int(user_id))
+    db.run("update app_subscriptions set status='premium',plan=:plan,expires_at=:expires,device_limit=coalesce(:limit,device_limit),updated_at=now() where telegram_id=:id",plan=plan,expires=expires,limit=device_limit,id=int(user_id))
     return get_user(db,user_id)
 def audit(db,admin_id,action,target_type,target_id=None,details=None):
     db.run("insert into app_admin_audit(admin_id,action,target_type,target_id,details) values(:admin,:action,:type,:target,:details)",admin=int(admin_id),action=action,type=target_type,target=str(target_id) if target_id is not None else None,details=details)
@@ -221,6 +230,11 @@ def balance_change(db,user_id,amount,kind,description,order_id=None):
 def reward_referrer(db,referred_id,order_id,amount):
     user=get_user(db,referred_id);inviter=user.get("referred_by") if user else None
     if not inviter:return 0
+    if int(inviter)==int(referred_id):return 0
+    inviter_user=get_user(db,inviter)
+    if not inviter_user or inviter_user.get("banned"):return 0
+    qualified=db.run("insert into app_referral_rewards(inviter_id,referred_id,order_id,kind,days) select :inviter,:referred,:order,'qualified_signup',:days where not exists (select 1 from app_referral_rewards where referred_id=:referred and kind='qualified_signup') returning id",inviter=int(inviter),referred=int(referred_id),order=int(order_id),days=REFERRAL_DAYS)
+    if qualified:extend_subscription(db,inviter,REFERRAL_DAYS,"Referral bonus")
     reward=round(float(amount)*REFERRAL_PERCENT/100,2)
     rows=db.run("insert into app_referral_rewards(inviter_id,referred_id,order_id,kind,amount) values(:inviter,:referred,:order,'purchase',:amount) on conflict do nothing returning id",inviter=int(inviter),referred=int(referred_id),order=int(order_id),amount=reward)
     if rows:

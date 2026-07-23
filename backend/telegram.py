@@ -30,10 +30,10 @@ def miniapp_keyboard(url):
     return {"inline_keyboard": [[{"text": "🚀 Открыть FluxVPN", "web_app": {"url": url}}]]}
 
 
-def channel_keyboard(include_check=True):
+def channel_keyboard(include_check=True, callback_data="check_channel_subscription"):
     rows = [[{"text": "📢 Подписаться на канал", "url": REQUIRED_CHANNEL_URL}]]
     if include_check:
-        rows.append([{"text": "✅ Проверить подписку", "callback_data": "check_channel_subscription"}])
+        rows.append([{"text": "✅ Проверить подписку", "callback_data": callback_data[:64]}])
     return {"inline_keyboard": rows}
 
 def is_channel_member(user_id):
