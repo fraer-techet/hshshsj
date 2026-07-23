@@ -1,10 +1,14 @@
 import json
+import threading
+import time
 import urllib.error
 import urllib.request
 
 from .config import BOT_TOKEN, REQUIRED_CHANNEL, REQUIRED_CHANNEL_URL
 
 BASE_URL = "https://api.telegram.org/bot" + BOT_TOKEN
+_MEMBER_CACHE={}
+_MEMBER_CACHE_LOCK=threading.Lock()
 
 def call(method, payload=None, timeout=60):
     data = json.dumps(payload).encode() if payload is not None else None
@@ -36,12 +40,16 @@ def channel_keyboard(include_check=True, callback_data="check_channel_subscripti
         rows.append([{"text": "✅ Проверить подписку", "callback_data": callback_data[:64]}])
     return {"inline_keyboard": rows}
 
-def is_channel_member(user_id):
+def is_channel_member(user_id,force=False):
+    user_id=int(user_id);now=time.time()
+    with _MEMBER_CACHE_LOCK:cached=_MEMBER_CACHE.get(user_id)
+    if cached and not force and cached[1]>now:return cached[0]
     try:
-        member = call("getChatMember", {"chat_id": REQUIRED_CHANNEL, "user_id": int(user_id)}, timeout=15)
+        member=call("getChatMember",{"chat_id":REQUIRED_CHANNEL,"user_id":user_id},timeout=8)
+        status=member.get("status");result=status in ("creator","administrator","member") or (status=="restricted" and member.get("is_member") is True)
+        ttl=300 if result else 20
+        with _MEMBER_CACHE_LOCK:_MEMBER_CACHE[user_id]=(result,now+ttl)
+        return result
     except Exception as error:
-        # Fail closed, but never swallow /start or turn the Mini App into a 500 error.
-        print(f"CHANNEL CHECK {user_id}: {error}", flush=True)
+        print(f"CHANNEL CHECK {user_id}: {error}",flush=True)
         return False
-    status = member.get("status")
-    return status in ("creator", "administrator", "member") or (status == "restricted" and member.get("is_member") is True)

@@ -1,4 +1,5 @@
 import secrets
+import threading
 import urllib.parse
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -79,20 +80,30 @@ MIGRATIONS = [
 "create table if not exists app_country_votes(telegram_id bigint not null references app_users(telegram_id),country_code text not null,country_name text not null,created_at timestamptz not null default now(),primary key(telegram_id,country_code))",
 "insert into app_bonus_tasks(code,title,reward_kind,reward_value,condition_type) values('channel','Подписка на канал FluxVPN','balance',10,'channel'),('first_purchase','Первая покупка Premium','days',2,'first_purchase'),('referral_purchase','Друг совершил покупку','balance',20,'referral_purchase') on conflict(code) do nothing",
 ]),
+(16, "incident_status", [
+"create table if not exists app_runtime_state(key text primary key,value text,updated_at timestamptz not null default now())",
+]),
 ]
 
 def connection():
     parsed=urllib.parse.urlparse(DATABASE_URL)
     return pg8000.native.Connection(user=urllib.parse.unquote(parsed.username or ""),password=urllib.parse.unquote(parsed.password or ""),host=parsed.hostname,port=parsed.port or 5432,database=(parsed.path or "/neondb").lstrip("/"),ssl_context=True)
 
+_MIGRATED=False
+_MIGRATION_LOCK=threading.Lock()
+
 @contextmanager
 def session():
-    db=connection()
+    global _MIGRATED
+    database=connection()
     try:
-        migrate(db)
-        yield db
+        if not _MIGRATED:
+            with _MIGRATION_LOCK:
+                if not _MIGRATED:
+                    migrate(database);_MIGRATED=True
+        yield database
     finally:
-        db.close()
+        database.close()
 
 def migrate(db):
     db.run("create table if not exists app_schema_migrations(version integer primary key,name text not null,applied_at timestamptz not null default now())")

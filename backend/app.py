@@ -49,7 +49,8 @@ def bootstrap(dbx,user):
     servers=[{"id":r[0],"name":r[1]} for r in dbx.run("select id,name from app_servers where enabled=true order by sort_order,id")]
     devices=[{"id":r[0],"name":r[1],"lastSeen":r[2]} for r in dbx.run("select id,device_name,last_seen from app_devices where telegram_id=:id and blocked=false and approved=true order by last_seen desc",id=user["telegram_id"])]
     recent=[dict(zip(("id","kind","days","amount","method","status","createdAt"),r)) for r in dbx.run("select id,kind,days,amount,method,status,created_at from app_orders where telegram_id=:id order by created_at desc limit 10",id=user["telegram_id"])]
-    return {"user":services.public_user(user),"subscription":subscription_state(user),"recentOrders":recent,"plans":[{"days":d,"price":p} for d,p in PLANS.items()],"familyPlans":[{"days":d,"price":p} for d,p in FAMILY_PLANS.items()],"custom":{"min":CUSTOM_MIN_DAYS,"max":CUSTOM_MAX_DAYS},"servers":servers,"devices":devices,"deviceLimit":TRIAL_DEVICE_LIMIT if user["status"]=="trial" else int(user.get("device_limit") or PREMIUM_DEVICE_LIMIT),"referral":{"days":REFERRAL_DAYS,"percent":REFERRAL_PERCENT,"url":"https://t.me/"+BOT_USERNAME+"?start=ref_"+user["referral_code"] if BOT_USERNAME else "ref_"+user["referral_code"]},"botUsername":BOT_USERNAME,"isAdmin":admin(user)}
+    network_rows=dbx.run("select value from app_runtime_state where key='network_incident'");network_status=network_rows[0][0] if network_rows else "normal"
+    return {"user":services.public_user(user),"subscription":subscription_state(user),"recentOrders":recent,"networkStatus":network_status,"plans":[{"days":d,"price":p} for d,p in PLANS.items()],"familyPlans":[{"days":d,"price":p} for d,p in FAMILY_PLANS.items()],"custom":{"min":CUSTOM_MIN_DAYS,"max":CUSTOM_MAX_DAYS},"servers":servers,"devices":devices,"deviceLimit":TRIAL_DEVICE_LIMIT if user["status"]=="trial" else int(user.get("device_limit") or PREMIUM_DEVICE_LIMIT),"referral":{"days":REFERRAL_DAYS,"percent":REFERRAL_PERCENT,"url":"https://t.me/"+BOT_USERNAME+"?start=ref_"+user["referral_code"] if BOT_USERNAME else "ref_"+user["referral_code"]},"botUsername":BOT_USERNAME,"isAdmin":admin(user)}
 def dashboard(dbx):
     scalar=lambda sql:float(dbx.run(sql)[0][0] or 0)
     return {"users":int(scalar("select count(*) from app_users")),"active":int(scalar("select count(*) from app_subscriptions where expires_at>now()")),"orders":int(scalar("select count(*) from app_orders")),"pending":int(scalar("select count(*) from app_orders where status='pending'")),"tickets":int(scalar("select count(*) from app_tickets where status='open'")),"servers":int(scalar("select count(*) from app_servers where enabled=true")),"revenue":scalar("select coalesce(sum(amount),0) from app_payments"),"today":scalar("select coalesce(sum(amount),0) from app_payments where created_at>=date_trunc('day',now())"),"week":scalar("select coalesce(sum(amount),0) from app_payments where created_at>=now()-interval '7 days'"),"month":scalar("select coalesce(sum(amount),0) from app_payments where created_at>=now()-interval '30 days'"),"family":int(scalar("select count(*) from app_subscriptions where plan='Family' and expires_at>now()")),"autoRenew":int(scalar("select count(*) from app_subscriptions where auto_renew=true")),"gifts":int(scalar("select count(*) from app_gifts where status='claimed'"))}
@@ -317,16 +318,17 @@ class Handler(BaseHTTPRequestHandler):
             identity=device_identity(self,agent);fingerprint=device_hash(identity)
             existing=dbx.run("select id,blocked,approved from app_devices where telegram_id=:id and device_hash=:hash",id=user["telegram_id"],hash=fingerprint)
             # Migrate old IP-based fingerprints and merge duplicates produced by changing mobile IPs.
-            if not existing and identity.startswith("ua:"):
-                candidates=dbx.run("select id,device_hash,user_agent,blocked from app_devices where telegram_id=:id order by last_seen desc",id=user["telegram_id"])
+            if not existing:
+                candidates=dbx.run("select id,device_hash,user_agent,blocked,approved from app_devices where telegram_id=:id order by approved desc,last_seen desc",id=user["telegram_id"])
                 matches=[row for row in candidates if normalize_agent(row[2])==normalize_agent(agent)]
                 blocked=next((row for row in matches if row[3]),None)
-                if blocked:existing=[(blocked[0],True,True)]
-                elif matches:
-                    keep=matches[0];dbx.run("delete from app_devices where telegram_id=:id and id<>:keep and user_agent is not null and lower(split_part(user_agent,'/',1))=lower(split_part(:agent,'/',1))",id=user["telegram_id"],keep=keep[0],agent=agent[:300])
+                approved=next((row for row in matches if row[4] and not row[3]),None)
+                if blocked and not approved:existing=[(blocked[0],True,True)]
+                elif approved or matches:
+                    keep=approved or matches[0];dbx.run("delete from app_devices where telegram_id=:id and id<>:keep and user_agent is not null and lower(split_part(user_agent,'/',1))=lower(split_part(:agent,'/',1))",id=user["telegram_id"],keep=keep[0],agent=agent[:300])
                     try:dbx.run("update app_devices set device_hash=:hash where id=:id",hash=fingerprint,id=keep[0])
                     except Exception:pass
-                    existing=[(keep[0],False,True)]
+                    existing=[(keep[0],False,bool(keep[4]))]
             if existing and existing[0][1]:sub_response(self,dummy("FluxVPN | Устройство удалено"),user);return
             if existing and not existing[0][2]:sub_response(self,dummy("FluxVPN | Подтвердите новое устройство в боте"),user);return
             limit=TRIAL_DEVICE_LIMIT if user["status"]=="trial" else int(user.get("device_limit") or PREMIUM_DEVICE_LIMIT)
@@ -392,9 +394,14 @@ def handle_bot_update(update):
             if not rows or int(rows[0][0])!=int(source["id"]):telegram_call("answerCallbackQuery",{"callback_query_id":callback["id"],"text":"Устройство не найдено","show_alert":True});return
             if action=="allow":dbx.run("update app_devices set approved=true,approved_at=now(),blocked=false where id=:id",id=device);db.security_event(dbx,source["id"],"device_approved",rows[0][1])
             else:dbx.run("update app_devices set blocked=true where id=:id",id=device);db.security_event(dbx,source["id"],"device_rejected",rows[0][1])
-        telegram_call("answerCallbackQuery",{"callback_query_id":callback["id"],"text":"Устройство разрешено ✅" if action=="allow" else "Устройство отклонено"});return
+        telegram_call("answerCallbackQuery",{"callback_query_id":callback["id"],"text":"Устройство разрешено ✅" if action=="allow" else "Устройство отклонено"})
+        message=callback.get("message") or {}
+        if message.get("chat") and message.get("message_id"):
+            try:telegram_call("editMessageReplyMarkup",{"chat_id":message["chat"]["id"],"message_id":message["message_id"],"reply_markup":{"inline_keyboard":[]}})
+            except Exception:pass
+        return
     if callback and (callback.get("data") or "").startswith("check_channel_subscription"):
-        source=callback["from"];joined=int(source["id"])==int(ADMIN_ID) or is_channel_member(source["id"]);data=callback.get("data") or ""
+        source=callback["from"];joined=int(source["id"])==int(ADMIN_ID) or is_channel_member(source["id"],force=True);data=callback.get("data") or ""
         telegram_call("answerCallbackQuery",{"callback_query_id":callback["id"],"text":"Подписка подтверждена ✅" if joined else "Сначала подпишись на канал","show_alert":not joined})
         if joined:
             message=callback.get("message") or {};chat_id=message.get("chat",{}).get("id",source["id"])
